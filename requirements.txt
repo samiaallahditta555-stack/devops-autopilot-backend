@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-openai
-pyGithub
-slack_sdk
-python-dotenv
-requests
+streamlit>=1.36.0
+crewai>=0.100.0
+PyGithub>=2.3.0
+slack_sdk>=3.27.0
+python-dotenv>=1.0.0
+
+pysqlite3-binary>=0.5.2; sys_platform == "linux"
