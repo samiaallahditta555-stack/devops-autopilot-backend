@@ -1,12 +1,7 @@
-streamlit>=1.36.0
-crewai>=0.100.0
-PyGithub>=2.3.0
-slack_sdk>=3.27.0
-python-dotenv>=1.0.0
-
-# Groq is reached through CrewAI's LiteLLM layer (model name "groq/<model>"),
-# so no separate Groq SDK is needed.
-
-# Streamlit Cloud ships an old SQLite that CrewAI's dependency (chromadb) rejects.
-# This wheel only exists for Linux, so the marker skips it on Windows/macOS.
-pysqlite3-binary>=0.5.2; sys_platform == "linux"
+fastapi
+uvicorn
+openai
+pyGithub
+slack_sdk
+python-dotenv
+requests
