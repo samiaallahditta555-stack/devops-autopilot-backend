@@ -209,9 +209,16 @@ def _build_llm() -> LLM:
     if not api_key or api_key.startswith("your_"):
         raise ConfigError("GROQ_API_KEY is missing. Add it to .env or Streamlit Secrets.")
     model = (os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL).strip()
-    if not model.startswith("groq/"):
-        model = f"groq/{model}"
-    return LLM(model=model, api_key=api_key, temperature=0.1)
+    if model.startswith("groq/"):
+        model = model[len("groq/"):]
+    # Groq is OpenAI-compatible. CrewAI's native OpenAI provider works with it
+    # and strips fields (cache_breakpoint) that Groq rejects.
+    return LLM(
+        model=f"openai/{model}",
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+        temperature=0.1,
+    )
 
 
 def _make_agents(llm: LLM) -> Tuple[Agent, Agent, Agent]:
