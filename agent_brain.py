@@ -351,8 +351,15 @@ def _fetch_source(stack_trace: str, warnings: List[str]) -> Tuple[Optional[str],
 def build_patch(file_path: Optional[str], source: Optional[str],
                 old: str, new: str) -> Dict[str, Any]:
     """Create a diff and (only if safe) the full updated file content."""
-    patch: Dict[str, Any] = {"file_path": file_path, "applied": False,
-                             "diff": "", "new_content": None, "reason": ""}
+    patch: Dict[str, Any] = {
+        "file_path": file_path,
+        "applied": False,
+        "diff": "",
+        "new_content": None,
+        "original_snippet": old or "",
+        "replacement_snippet": new or "",
+        "reason": "",
+    }
     if old and new and old != new:
         patch["diff"] = "".join(difflib.unified_diff(
             old.splitlines(keepends=True), new.splitlines(keepends=True),
