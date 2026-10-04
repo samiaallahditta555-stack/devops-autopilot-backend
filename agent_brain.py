@@ -377,58 +377,96 @@ def build_patch(file_path: Optional[str], source: Optional[str],
 
 def validate_proposed_patch(patch: Dict[str, Any]) -> Dict[str, str]:
     """
-    Validate the proposed patch without changing, committing, or deploying
+    Validate the proposed fix without changing, committing, or deploying
     repository code.
 
-    Python files get a real syntax/compile check using the Python interpreter.
-    Other languages are conservatively reported as NOT RUN unless a dedicated
-    validator is available.
+    If a complete patched file is available, validate that file.
+    If the source snippet could not be safely applied because the repository
+    source did not match exactly, validate the proposed replacement snippet
+    itself when it is Python. This keeps validation independent from patch
+    application while never claiming that repository tests were executed.
     """
-    if not patch.get("applied"):
-        return {
-            "status": "NOT RUN",
-            "details": "No executable validation was available because no safe patch was prepared.",
-        }
-
     file_path = str(patch.get("file_path") or "")
     new_content = patch.get("new_content")
+    replacement = patch.get("replacement_snippet")
 
-    if not isinstance(new_content, str) or not new_content.strip():
-        return {
-            "status": "NOT RUN",
-            "details": "The proposed patch did not contain executable file content.",
-        }
+    # Normal case: the complete proposed file is available.
+    content_to_validate = new_content
+    validation_target = "the complete proposed patched file"
+
+    # Fallback: the patch could not be applied, but the AI still produced a
+    # replacement snippet. Validate that snippet instead of immediately
+    # returning NOT RUN.
+    if not isinstance(content_to_validate, str) or not content_to_validate.strip():
+        if isinstance(replacement, str) and replacement.strip():
+            content_to_validate = replacement
+            validation_target = "the proposed replacement snippet"
+        else:
+            return {
+                "status": "NOT RUN",
+                "details": (
+                    "No executable code was available to validate. "
+                    "The proposed fix did not contain a usable replacement."
+                ),
+            }
 
     extension = os.path.splitext(file_path)[1].lower()
 
-    if extension == ".py":
+    if extension == ".py" or not extension:
         try:
-            ast.parse(new_content, filename=file_path or "<proposed_patch>")
-            compile(new_content, file_path or "<proposed_patch>", "exec")
+            ast.parse(
+                content_to_validate,
+                filename=file_path or "<proposed_fix>",
+            )
+            compile(
+                content_to_validate,
+                file_path or "<proposed_fix>",
+                "exec",
+            )
             return {
                 "status": "PASSED",
-                "details": "Python syntax and compilation check passed for the proposed patched file.",
+                "details": (
+                    f"Python syntax and compilation validation passed for "
+                    f"{validation_target}. No repository tests were executed."
+                ),
             }
-        except (SyntaxError, ValueError, TypeError) as exc:
+        except SyntaxError as exc:
             line = getattr(exc, "lineno", None)
             location = f" at line {line}" if line else ""
             return {
                 "status": "FAILED",
-                "details": f"Python syntax validation failed{location}.",
+                "details": (
+                    f"Python syntax validation failed{location} "
+                    f"for {validation_target}."
+                ),
+            }
+        except (ValueError, TypeError):
+            return {
+                "status": "FAILED",
+                "details": (
+                    f"Python compilation validation failed for "
+                    f"{validation_target}."
+                ),
             }
         except Exception:
             return {
                 "status": "FAILED",
-                "details": "The proposed Python patch could not be compiled.",
+                "details": (
+                    f"The proposed Python code could not be compiled "
+                    f"for {validation_target}."
+                ),
             }
 
     return {
         "status": "NOT RUN",
         "details": (
-            f"No safe built-in validator is configured for '{extension or 'this file type'}'. "
-            "The patch remains a proposal for human review."
+            f"No safe built-in validator is configured for "
+            f"'{extension or 'this file type'}'. "
+            "The proposed fix remains subject to human review."
         ),
     }
+
+
 
 
 # --------------------------------------------------------------------------
