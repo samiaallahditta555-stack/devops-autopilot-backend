@@ -287,7 +287,6 @@ MONITOR_KEYS = (
     "initial_observation (1-2 sentences)."
 )
 
-# UPDATED: Strict match instruction for original_snippet
 DIAGNOSER_KEYS = (
     "Keys: root_cause, affected_file (repo-relative path or 'Unknown'), affected_function, "
     "explanation, proposed_fix (plain-language description), "
@@ -381,7 +380,7 @@ def build_patch(file_path: Optional[str], source: Optional[str],
 
 
 # --------------------------------------------------------------------------
-# Proposed patch validation (UPDATED WITH REAL TEST RUNNER)
+# Proposed patch validation
 # --------------------------------------------------------------------------
 
 def validate_proposed_patch(patch: Dict[str, Any]) -> Dict[str, str]:
@@ -501,108 +500,4 @@ def run_incident_response(incident_data: Dict[str, Any],
         raw = _run_task(
             monitor,
             "Analyse this production incident and write a structured incident report.\n"
-            f"{_UNTRUSTED_NOTE}\n{MONITOR_KEYS}\n\n<<<INCIDENT_DATA\n" f"{_incident_block(cleaned)}\nINCIDENT_DATA>>>",
-            "A single JSON object with the incident report.",
-        )
-    except Exception as exc:  # noqa: BLE001
-        notify("monitor", "failed")
-        result["error"] = _friendly_error(exc, "Monitor agent")
-        return result
-    parsed, ok = parse_json_response(raw)
-    if not ok:
-        warnings.append("Monitor agent returned malformed output; defaults were used.")
-    status = cleaned["http_status"]
-    report = _coerce(parsed, {
-        "incident_summary": f"{cleaned['service']}: {cleaned['error_message'][:120] or 'error reported'}",
-        "severity": "HIGH" if status.startswith("5") else "MEDIUM",
-        "detected_error": cleaned["error_message"][:80] or "Unknown",
-        "affected_service": cleaned["service"],
-        "initial_observation": "Automatic analysis was incomplete; manual review recommended.",
-    })
-    report["severity"] = _norm_level(report["severity"], SEVERITIES, "MEDIUM")
-    result["incident_report"] = report
-    notify("monitor", "done")
-
-    # ---- Stage 2: Diagnoser & Fixer Agent ----------------------------------
-    notify("diagnoser", "running")
-    logger.info("Diagnosis started")
-    file_path, source = _fetch_source(cleaned["stack_trace"], warnings)
-    source_block = (
-        f"File path: {file_path}\n{source[:MAX_SOURCE_CHARS]}" if source
-        else "(source code not available; reason only from the stack trace)"
-    )
-    try:
-        raw = _run_task(
-            diagnoser,
-            "Diagnose the root cause and propose a minimal fix.\n"
-            f"{_UNTRUSTED_NOTE}\n{DIAGNOSER_KEYS}\n\n<<<INCIDENT_REPORT\n" f"{json.dumps(report)}\nINCIDENT_REPORT>>>\n\n<<<INCIDENT_DATA\n" f"{_incident_block(cleaned)}\nINCIDENT_DATA>>>\n\n<<<SOURCE_CODE\n" f"{redact_secrets(source_block)}\nSOURCE_CODE>>>",
-            "A single JSON object with the diagnosis and proposed fix.",
-        )
-    except Exception as exc:  # noqa: BLE001
-        notify("diagnoser", "failed")
-        result["error"] = _friendly_error(exc, "Diagnoser agent")
-        return result
-    parsed, ok = parse_json_response(raw)
-    if not ok:
-        warnings.append("Diagnoser agent returned malformed output; defaults were used.")
-    diagnosis = _coerce(parsed, {
-        "root_cause": "Could not be determined automatically; manual investigation required.",
-        "affected_file": file_path or "Unknown",
-        "affected_function": "Unknown",
-        "explanation": "No explanation available.",
-        "proposed_fix": "No fix proposed.",
-        "original_snippet": "",
-        "replacement_snippet": "",
-        "risk_level": "HIGH",
-        "test_plan": ["Reproduce the incident in a staging environment."],
-    })
-    diagnosis["risk_level"] = _norm_level(diagnosis["risk_level"], RISK_LEVELS, "HIGH")
-    result["diagnosis"] = diagnosis
-    
-    patch = build_patch(file_path, source, diagnosis["original_snippet"],
-                        diagnosis["replacement_snippet"])
-    result["patch"] = patch
-
-    # Validate patch
-    validation = validate_proposed_patch(patch)
-    result["validation_status"] = validation["status"]
-    result["validation_details"] = validation["details"]
-
-    if validation["status"] in ("FAILED", "NOT RUN"):
-        warnings.append(validation["details"])
-
-    notify("diagnoser", "done")
-
-    # ---- Stage 3: Guard & Orchestrator Agent --------------------------------
-    notify("guard", "running")
-    logger.info("Guard review started")
-    try:
-        raw = _run_task(
-            guard,
-            "Review this proposed remediation and prepare the human approval request.\n"
-            f"{_UNTRUSTED_NOTE}\n{GUARD_KEYS}\n\n<<<INCIDENT_REPORT\n{json.dumps(report)}\n" f"INCIDENT_REPORT>>>\n\n<<<DIAGNOSIS\n" !="explanation" diagnosis.items() f"DIAGNOSIS f"{json.dumps({k: for if in k k, v })}\n">>>\n\n<<<DIFF\n{patch['diff'] '(no diff)'}\nDIFF or>>>\n\n"
-            f"<<<VALIDATION\nStatus: f"Details: {result['validation_details']}\nVALIDATION {result['validation_status']}\n">>>",
-            "A single JSON object with the safety review.",
-        )
-    except Exception as exc:  # noqa: BLE001
-        notify("guard", "failed")
-        result["error"] = _friendly_error(exc, "Guard agent")
-        return result
-    parsed, ok = parse_json_response(raw)
-    if not ok:
-        warnings.append("Guard agent returned malformed output; conservative defaults were used.")
-    review = _coerce(parsed, {
-        "incident_summary": report["incident_summary"],
-        "risk_level": "HIGH",
-        "risk_reasoning": "Automatic review incomplete; treat as high risk.",
-        "recommendation": "Review the proposal manually before taking any action.",
-        "concerns": [],
-    })
-    review["risk_level"] = _norm_level(review["risk_level"], RISK_LEVELS, "HIGH")
-    result["guard_review"] = review
-    result["final_risk"] = _max_risk(diagnosis["risk_level"], review["risk_level"])
-    notify("guard", "done")
-
-    result["ok"] = True
-    logger.info("Analysis complete; approval PENDING")
-    return result
+            f"{_UNTRUSTED_NOTE}\n{MONITOR_KEYS}\n\n
