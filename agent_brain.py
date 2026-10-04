@@ -15,11 +15,14 @@ Design rules:
   * Secrets are redacted before text is sent to the model or shown to users.
 """
 
+import ast
 import difflib
 import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -298,7 +301,9 @@ GUARD_KEYS = (
     "Keys: incident_summary (2-3 sentences for a Slack message), risk_level (LOW|MEDIUM|HIGH), "
     "risk_reasoning (1-2 sentences), recommendation (what the human reviewer should do), "
     "concerns (list of short strings; empty list if none). "
-    "Remember: no validation or tests have been run."
+    "Validation status: {validation_status}. "
+    "Validation details: {validation_details}. "
+    "Do not claim that tests passed unless the validation result explicitly says PASSED."
 )
 
 
@@ -370,6 +375,70 @@ def build_patch(file_path: Optional[str], source: Optional[str],
     return patch
 
 
+def validate_patch(patch: Dict[str, Any]) -> Tuple[str, str]:
+    """Validate a proposed patch without changing the real repository.
+
+    Python patches get a real syntax/compile check. Other languages are only
+    validated when an explicit VALIDATION_COMMAND is configured. The command
+    runs against a temporary copy and is never allowed to modify the repo.
+    """
+    if not patch.get("applied") or not patch.get("new_content"):
+        return "NOT RUN", "No safe candidate patch was prepared."
+
+    file_path = str(patch.get("file_path") or "")
+    new_content = str(patch.get("new_content") or "")
+    suffix = os.path.splitext(file_path)[1].lower()
+
+    if suffix == ".py":
+        try:
+            ast.parse(new_content, filename=file_path or "candidate.py")
+            compile(new_content, file_path or "candidate.py", "exec")
+            return "PASSED", "Python syntax and compilation check passed on the proposed file."
+        except (SyntaxError, ValueError, TypeError) as exc:
+            line = getattr(exc, "lineno", None)
+            detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            if line:
+                detail = f"line {line}: {detail}"
+            return "FAILED", f"Python validation failed: {detail}"
+
+    command = (os.getenv("VALIDATION_COMMAND") or "").strip()
+    if not command:
+        return "NOT RUN", (
+            f"No automatic validator is configured for {suffix or 'this'} files. "
+            "Set VALIDATION_COMMAND to enable an explicit test command."
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="devops_autopilot_validation_") as tmp:
+            candidate = os.path.join(tmp, os.path.basename(file_path) or "candidate.txt")
+            with open(candidate, "w", encoding="utf-8") as handle:
+                handle.write(new_content)
+
+            # The command is administrator-configured, not model-generated.
+            # It runs in an isolated temporary directory with a short timeout.
+            env = os.environ.copy()
+            env["VALIDATION_FILE"] = candidate
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=tmp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = (completed.stdout or completed.stderr or "").strip()
+            output = redact_secrets(output)[:1000]
+            if completed.returncode == 0:
+                return "PASSED", output or "Configured validation command completed successfully."
+            return "FAILED", output or f"Configured validation command exited with code {completed.returncode}."
+    except subprocess.TimeoutExpired:
+        return "FAILED", "Configured validation command timed out after 30 seconds."
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Patch validation failed: %s", type(exc).__name__)
+        return "FAILED", "The configured validation command could not be executed."
+
+
 # --------------------------------------------------------------------------
 # Main workflow
 # --------------------------------------------------------------------------
@@ -386,8 +455,9 @@ def run_incident_response(incident_data: Dict[str, Any],
         "incident_source": "Manual / Simulated",
         "incident_report": {}, "diagnosis": {}, "guard_review": {},
         "patch": {}, "final_risk": "HIGH",
-        "validation_status": "NOT RUN",   # forced: we never execute tests
-        "approval_status": "PENDING",     # forced: only a human can change this
+        "validation_status": "NOT RUN",
+        "validation_details": "Validation has not started yet.",
+        "approval_status": "PENDING",     # only a human can change this
     }
     warnings: List[str] = result["warnings"]
 
@@ -479,6 +549,18 @@ def run_incident_response(incident_data: Dict[str, Any],
     patch = build_patch(file_path, source, diagnosis["original_snippet"],
                         diagnosis["replacement_snippet"])
     result["patch"] = patch
+
+    # Validate the proposed file before the human approval review. This is
+    # validation of the candidate patch only; nothing is committed or deployed.
+    notify("validation", "running")
+    validation_status, validation_details = validate_patch(patch)
+    result["validation_status"] = validation_status
+    result["validation_details"] = validation_details
+    if validation_status == "FAILED":
+        warnings.append("The proposed patch failed validation and must not be approved as-is.")
+    elif validation_status == "NOT RUN":
+        warnings.append("No executable validation was available for the proposed patch.")
+    notify("validation", "done")
     notify("diagnoser", "done")
 
     # ---- Stage 3: Guard & Orchestrator Agent --------------------------------
@@ -491,7 +573,9 @@ def run_incident_response(incident_data: Dict[str, Any],
             f"{_UNTRUSTED_NOTE}\n{GUARD_KEYS}\n\n<<<INCIDENT_REPORT\n{json.dumps(report)}\n"
             f"INCIDENT_REPORT>>>\n\n<<<DIAGNOSIS\n"
             f"{json.dumps({k: v for k, v in diagnosis.items() if k != 'explanation'})}\n"
-            f"DIAGNOSIS>>>\n\n<<<DIFF\n{patch['diff'] or '(no diff)'}\nDIFF>>>",
+            f"DIAGNOSIS>>>\n\n<<<DIFF\n{patch['diff'] or '(no diff)'}\nDIFF>>>\n\n"
+            f"<<<VALIDATION\nStatus: {result['validation_status']}\nDetails: "
+            f"{result['validation_details']}\nVALIDATION>>>",
             "A single JSON object with the safety review.",
         )
     except Exception as exc:  # noqa: BLE001
