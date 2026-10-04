@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -213,10 +212,12 @@ def _build_llm() -> LLM:
     model = (os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL).strip()
     if model.startswith("groq/"):
         model = model[len("groq/"):]
+    # Groq is OpenAI-compatible. CrewAI's native OpenAI provider works with it
+    # and strips fields (cache_breakpoint) that Groq rejects.
     return LLM(
         model=f"openai/{model}",
         api_key=api_key,
-        base_url="[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)",
+        base_url="https://api.groq.com/openai/v1",
         temperature=0.1,
     )
 
@@ -286,16 +287,14 @@ MONITOR_KEYS = (
     "detected_error (error type, e.g. AttributeError), affected_service, "
     "initial_observation (1-2 sentences)."
 )
-
 DIAGNOSER_KEYS = (
     "Keys: root_cause, affected_file (repo-relative path or 'Unknown'), affected_function, "
     "explanation, proposed_fix (plain-language description), "
-    "original_snippet (EXACT consecutive lines from SOURCE_CODE without altering indentation or spaces, "
+    "original_snippet (EXACT existing lines to replace, copied verbatim from the source, "
     "or empty string if unsure), replacement_snippet (the corrected lines), "
     "risk_level (LOW|MEDIUM|HIGH), test_plan (list of short test descriptions). "
     "Keep the fix minimal. Do not invent code that is not shown."
 )
-
 GUARD_KEYS = (
     "Keys: incident_summary (2-3 sentences for a Slack message), risk_level (LOW|MEDIUM|HIGH), "
     "risk_reasoning (1-2 sentences), recommendation (what the human reviewer should do), "
@@ -312,7 +311,7 @@ def _candidate_files(stack_trace: str) -> List[str]:
     """Guess repo-relative file paths from a stack trace."""
     paths = re.findall(r"([\w./\\-]+\.(?:py|js|ts|java|go|rb))", stack_trace or "")
     candidates: List[str] = []
-    for raw in reversed(paths):
+    for raw in reversed(paths):  # the last frame is usually the failing one
         if "site-packages" in raw or "node_modules" in raw:
             continue
         parts = [p for p in raw.replace("\\", "/").split("/") if p and p != "."]
@@ -385,74 +384,96 @@ def build_patch(file_path: Optional[str], source: Optional[str],
 
 def validate_proposed_patch(patch: Dict[str, Any]) -> Dict[str, str]:
     """
-    Validate Python syntax and run pytest test suite if available.
+    Validate the proposed fix without changing, committing, or deploying
+    repository code.
+
+    If a complete patched file is available, validate that file.
+    If the source snippet could not be safely applied because the repository
+    source did not match exactly, validate the proposed replacement snippet
+    itself when it is Python. This keeps validation independent from patch
+    application while never claiming that repository tests were executed.
     """
     file_path = str(patch.get("file_path") or "")
     new_content = patch.get("new_content")
     replacement = patch.get("replacement_snippet")
 
-    content_to_validate = new_content if (isinstance(new_content, str) and new_content.strip()) else replacement
-    validation_target = "the complete proposed patched file" if (isinstance(new_content, str) and new_content.strip()) else "the proposed replacement snippet"
+    # Normal case: the complete proposed file is available.
+    content_to_validate = new_content
+    validation_target = "the complete proposed patched file"
 
+    # Fallback: the patch could not be applied, but the AI still produced a
+    # replacement snippet. Validate that snippet instead of immediately
+    # returning NOT RUN.
     if not isinstance(content_to_validate, str) or not content_to_validate.strip():
-        return {
-            "status": "NOT RUN",
-            "details": "No executable code was available to validate. The proposed fix did not contain a usable replacement.",
-        }
+        if isinstance(replacement, str) and replacement.strip():
+            content_to_validate = replacement
+            validation_target = "the proposed replacement snippet"
+        else:
+            return {
+                "status": "NOT RUN",
+                "details": (
+                    "No executable code was available to validate. "
+                    "The proposed fix did not contain a usable replacement."
+                ),
+            }
 
     extension = os.path.splitext(file_path)[1].lower()
 
     if extension == ".py" or not extension:
-        # Step 1: Syntax / AST Check
         try:
-            ast.parse(content_to_validate, filename=file_path or "<proposed_fix>")
-            compile(content_to_validate, file_path or "<proposed_fix>", "exec")
+            ast.parse(
+                content_to_validate,
+                filename=file_path or "<proposed_fix>",
+            )
+            compile(
+                content_to_validate,
+                file_path or "<proposed_fix>",
+                "exec",
+            )
+            return {
+                "status": "PASSED",
+                "details": (
+                    f"Python syntax and compilation validation passed for "
+                    f"{validation_target}. No repository tests were executed."
+                ),
+            }
         except SyntaxError as exc:
             line = getattr(exc, "lineno", None)
             location = f" at line {line}" if line else ""
             return {
                 "status": "FAILED",
-                "details": f"Python syntax validation failed{location} for {validation_target}."
+                "details": (
+                    f"Python syntax validation failed{location} "
+                    f"for {validation_target}."
+                ),
+            }
+        except (ValueError, TypeError):
+            return {
+                "status": "FAILED",
+                "details": (
+                    f"Python compilation validation failed for "
+                    f"{validation_target}."
+                ),
             }
         except Exception:
             return {
                 "status": "FAILED",
-                "details": f"The proposed Python code could not be compiled for {validation_target}."
-            }
-
-        # Step 2: Test Suite Execution (pytest)
-        try:
-            test_run = subprocess.run(
-                ["pytest"], 
-                capture_output=True, 
-                text=True, 
-                timeout=20
-            )
-            if test_run.returncode == 0:
-                return {
-                    "status": "PASSED",
-                    "details": f"Python syntax validated and repository test suite PASSED successfully for {validation_target}."
-                }
-            else:
-                return {
-                    "status": "PASSED (Syntax Only)",
-                    "details": f"Python syntax passed for {validation_target}, but repository tests failed or were not configured."
-                }
-        except FileNotFoundError:
-            return {
-                "status": "PASSED",
-                "details": f"Python syntax and compilation validation PASSED for {validation_target}."
-            }
-        except Exception as exc:
-            return {
-                "status": "PASSED",
-                "details": f"Python syntax passed for {validation_target}. Test execution skipped: {exc}"
+                "details": (
+                    f"The proposed Python code could not be compiled "
+                    f"for {validation_target}."
+                ),
             }
 
     return {
         "status": "NOT RUN",
-        "details": f"No safe built-in validator is configured for '{extension or 'this file type'}'.",
+        "details": (
+            f"No safe built-in validator is configured for "
+            f"'{extension or 'this file type'}'. "
+            "The proposed fix remains subject to human review."
+        ),
     }
+
+
 
 
 # --------------------------------------------------------------------------
@@ -500,4 +521,116 @@ def run_incident_response(incident_data: Dict[str, Any],
         raw = _run_task(
             monitor,
             "Analyse this production incident and write a structured incident report.\n"
-            f"{_UNTRUSTED_NOTE}\n{MONITOR_KEYS}\n\n
+            f"{_UNTRUSTED_NOTE}\n{MONITOR_KEYS}\n\n<<<INCIDENT_DATA\n"
+            f"{_incident_block(cleaned)}\nINCIDENT_DATA>>>",
+            "A single JSON object with the incident report.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        notify("monitor", "failed")
+        result["error"] = _friendly_error(exc, "Monitor agent")
+        return result
+    parsed, ok = parse_json_response(raw)
+    if not ok:
+        warnings.append("Monitor agent returned malformed output; defaults were used.")
+    status = cleaned["http_status"]
+    report = _coerce(parsed, {
+        "incident_summary": f"{cleaned['service']}: {cleaned['error_message'][:120] or 'error reported'}",
+        "severity": "HIGH" if status.startswith("5") else "MEDIUM",
+        "detected_error": cleaned["error_message"][:80] or "Unknown",
+        "affected_service": cleaned["service"],
+        "initial_observation": "Automatic analysis was incomplete; manual review recommended.",
+    })
+    report["severity"] = _norm_level(report["severity"], SEVERITIES, "MEDIUM")
+    result["incident_report"] = report
+    notify("monitor", "done")
+
+    # ---- Stage 2: Diagnoser & Fixer Agent ----------------------------------
+    notify("diagnoser", "running")
+    logger.info("Diagnosis started")
+    file_path, source = _fetch_source(cleaned["stack_trace"], warnings)
+    source_block = (
+        f"File path: {file_path}\n{source[:MAX_SOURCE_CHARS]}" if source
+        else "(source code not available; reason only from the stack trace)"
+    )
+    try:
+        raw = _run_task(
+            diagnoser,
+            "Diagnose the root cause and propose a minimal fix.\n"
+            f"{_UNTRUSTED_NOTE}\n{DIAGNOSER_KEYS}\n\n<<<INCIDENT_REPORT\n"
+            f"{json.dumps(report)}\nINCIDENT_REPORT>>>\n\n<<<INCIDENT_DATA\n"
+            f"{_incident_block(cleaned)}\nINCIDENT_DATA>>>\n\n<<<SOURCE_CODE\n"
+            f"{redact_secrets(source_block)}\nSOURCE_CODE>>>",
+            "A single JSON object with the diagnosis and proposed fix.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        notify("diagnoser", "failed")
+        result["error"] = _friendly_error(exc, "Diagnoser agent")
+        return result
+    parsed, ok = parse_json_response(raw)
+    if not ok:
+        warnings.append("Diagnoser agent returned malformed output; defaults were used.")
+    diagnosis = _coerce(parsed, {
+        "root_cause": "Could not be determined automatically; manual investigation required.",
+        "affected_file": file_path or "Unknown",
+        "affected_function": "Unknown",
+        "explanation": "No explanation available.",
+        "proposed_fix": "No fix proposed.",
+        "original_snippet": "",
+        "replacement_snippet": "",
+        "risk_level": "HIGH",
+        "test_plan": ["Reproduce the incident in a staging environment."],
+    })
+    diagnosis["risk_level"] = _norm_level(diagnosis["risk_level"], RISK_LEVELS, "HIGH")
+    result["diagnosis"] = diagnosis
+    # Only commit to the file we actually read from the repository.
+    patch = build_patch(file_path, source, diagnosis["original_snippet"],
+                        diagnosis["replacement_snippet"])
+    result["patch"] = patch
+
+    # Validate the proposed patched content before the safety review.
+    validation = validate_proposed_patch(patch)
+    result["validation_status"] = validation["status"]
+    result["validation_details"] = validation["details"]
+
+    if validation["status"] in ("FAILED", "NOT RUN"):
+        warnings.append(validation["details"])
+
+    notify("diagnoser", "done")
+
+    # ---- Stage 3: Guard & Orchestrator Agent --------------------------------
+    notify("guard", "running")
+    logger.info("Guard review started")
+    try:
+        raw = _run_task(
+            guard,
+            "Review this proposed remediation and prepare the human approval request.\n"
+            f"{_UNTRUSTED_NOTE}\n{GUARD_KEYS}\n\n<<<INCIDENT_REPORT\n{json.dumps(report)}\n"
+            f"INCIDENT_REPORT>>>\n\n<<<DIAGNOSIS\n"
+            f"{json.dumps({k: v for k, v in diagnosis.items() if k != 'explanation'})}\n"
+            f"DIAGNOSIS>>>\n\n<<<DIFF\n{patch['diff'] or '(no diff)'}\nDIFF>>>\n\n"
+            f"<<<VALIDATION\nStatus: {result['validation_status']}\n"
+            f"Details: {result['validation_details']}\nVALIDATION>>>",
+            "A single JSON object with the safety review.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        notify("guard", "failed")
+        result["error"] = _friendly_error(exc, "Guard agent")
+        return result
+    parsed, ok = parse_json_response(raw)
+    if not ok:
+        warnings.append("Guard agent returned malformed output; conservative defaults were used.")
+    review = _coerce(parsed, {
+        "incident_summary": report["incident_summary"],
+        "risk_level": "HIGH",
+        "risk_reasoning": "Automatic review incomplete; treat as high risk.",
+        "recommendation": "Review the proposal manually before taking any action.",
+        "concerns": [],
+    })
+    review["risk_level"] = _norm_level(review["risk_level"], RISK_LEVELS, "HIGH")
+    result["guard_review"] = review
+    result["final_risk"] = _max_risk(diagnosis["risk_level"], review["risk_level"])
+    notify("guard", "done")
+
+    result["ok"] = True
+    logger.info("Analysis complete; approval PENDING")
+    return result
